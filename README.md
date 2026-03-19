@@ -108,6 +108,8 @@ Run the async flow test (mocked, no network calls):
 python tests/test_async_flow.py
 ```
 
+Why mocked: this keeps the PoC lightweight while still proving the async polling loop and state transitions without requiring a real long-running OGC process.
+
 ## Architecture Notes
 
 - Layer 1 (FastMCP): Thin async HTTP wrappers over pygeoapi. No process-specific logic.
