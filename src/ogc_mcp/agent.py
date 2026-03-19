@@ -8,6 +8,7 @@ State machine: IDLE -> SUBMITTED -> POLLING -> SUCCESS / FAILED
 import asyncio
 import json
 import os
+import re
 from typing import Literal
 
 from dotenv import load_dotenv
@@ -23,20 +24,31 @@ load_dotenv()
 HF_MODEL_NAME = os.getenv("HF_MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct:sambanova")
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
 
-SYSTEM_PROMPT = """You are a geospatial assistant connected to an OGC Processes API.
+SYSTEM_PROMPT = """\
+You are a geospatial assistant connected to an OGC Processes API.
 
 You have access to these tools:
-- list_processes()
-- execute_process(process_id: str, inputs: dict)
-- get_job_status(job_id: str)
-- get_job_result(job_id: str)
+- list_processes(): Lists all available processes on the OGC server.
+- execute_process(process_id, inputs): Submits a process for execution. 'process_id' is a string, 'inputs' is a JSON object.
+- get_job_status(job_id): Checks the status of a submitted job.
+- get_job_result(job_id): Retrieves the result of a completed job.
 
-When you need to use a tool, respond with EXACTLY a JSON object like:
-{"tool_call": "execute_process", "args": {"process_id": "...", "inputs": {...}}}
+IMPORTANT RULES:
+1. When you need to call a tool, you MUST respond with ONLY a JSON object in this exact format (no other text before or after):
+{"tool_call": "<tool_name>", "args": {<arguments>}}
 
-When you are ready to answer the user, respond with plain text (no JSON).
+2. When you have the final answer for the user, respond with plain text only (no JSON).
 
-Never make up results. Always use the tools to get real data.
+3. Never make up or fabricate results. Always use the tools and wait for real data.
+
+4. Follow this workflow for executing a process:
+   Step 1: Call execute_process with the process_id and inputs
+   Step 2: If you get a jobID back, call get_job_status with that jobID
+   Step 3: If status is "successful", call get_job_result with the jobID
+   Step 4: Present the result to the user in plain text
+
+Example tool call:
+{"tool_call": "execute_process", "args": {"process_id": "hello-world", "inputs": {"name": "Test"}}}
 """
 
 POLL_INTERVAL = 2   # seconds between status polls
@@ -47,7 +59,7 @@ _client = InferenceClient(api_key=HF_TOKEN)
 
 
 class Message(TypedDict):
-    role: str      # "user" | "model" | "tool"
+    role: str      # "user" | "assistant" | "tool"
     content: str   # serialized text or JSON
 
 
@@ -69,18 +81,52 @@ def _hf_call(history: list[Message]) -> str:
         role = msg["role"]
         content = msg["content"]
         if role == "tool":
-            chat.append({"role": "user", "content": f"Tool result: {content}"})
+            # Feed tool results as user messages so the model sees the data
+            chat.append({"role": "user", "content": f"Tool result:\n{content}"})
+        elif role == "assistant":
+            chat.append({"role": "assistant", "content": content})
         else:
-            chat.append({"role": role, "content": content})
+            # user messages
+            chat.append({"role": "user", "content": content})
+
+    print(f"\n[DEBUG] Sending {len(chat)} messages to HF model")
+    for i, m in enumerate(chat):
+        preview = m["content"][:120].replace("\n", "\\n")
+        print(f"  [{i}] {m['role']}: {preview}...")
 
     completion = _client.chat.completions.create(
         model=HF_MODEL_NAME,
         messages=chat,
+        max_tokens=512,
+        temperature=0.1,  # Low temperature for more deterministic tool calls
     )
-    return completion.choices[0].message.content.strip()
+    response = completion.choices[0].message.content.strip()
+    print(f"\n[DEBUG] Model response: {response[:300]}")
+    return response
+
 
 def _extract_tool_call(text: str) -> dict | None:
     """Extract the first JSON tool_call object from a mixed response."""
+    # Try to find a JSON object with tool_call and args
+    # First, try the entire text as JSON
+    try:
+        obj = json.loads(text.strip())
+        if isinstance(obj, dict) and "tool_call" in obj and "args" in obj:
+            return obj
+    except json.JSONDecodeError:
+        pass
+
+    # Try to find JSON in code blocks
+    code_block = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if code_block:
+        try:
+            obj = json.loads(code_block.group(1))
+            if isinstance(obj, dict) and "tool_call" in obj and "args" in obj:
+                return obj
+        except json.JSONDecodeError:
+            pass
+
+    # Scan for embedded JSON objects
     decoder = json.JSONDecoder()
     for i, ch in enumerate(text):
         if ch != "{":
@@ -95,7 +141,7 @@ def _extract_tool_call(text: str) -> dict | None:
 
 
 async def call_llm(state: AgentState) -> dict:
-    """Ask the local model what to do next."""
+    """Ask the HF model what to do next."""
     print(f"\n[Agent . LLM] Thinking... (phase={state['phase']})")
     response_text = await asyncio.to_thread(_hf_call, state["messages"])
 
@@ -104,7 +150,7 @@ async def call_llm(state: AgentState) -> dict:
         print(f"[Agent . LLM] Wants to call: {data['tool_call']}({data['args']})")
         return {
             "messages": [{
-                "role": "model",
+                "role": "assistant",
                 "content": json.dumps({
                     "tool_call": data["tool_call"],
                     "args": data["args"],
@@ -114,7 +160,7 @@ async def call_llm(state: AgentState) -> dict:
 
     print("[Agent . LLM] Final answer ready.")
     return {
-        "messages": [{"role": "model", "content": response_text}],
+        "messages": [{"role": "assistant", "content": response_text}],
         "final_answer": response_text,
     }
 
@@ -140,6 +186,9 @@ async def execute_tools(state: AgentState) -> dict:
                 new_job_id = result["jobID"]
                 new_phase = "SUBMITTED"
                 print(f"[Agent . State] SUBMITTED - jobID={new_job_id}")
+            elif result.get("status") == "successful":
+                new_phase = "SUCCESS"
+                print("[Agent . State] SUCCESS - synchronous execution!")
         elif tool_name == "get_job_status":
             result = await get_job_status(**tool_args)
             status = result.get("status", "unknown")
