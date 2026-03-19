@@ -1,54 +1,46 @@
-# OGC-MCP PoC — GSoC 2026
+# OGC-MCP PoC - GSoC 2026
 
-> **Proof of Concept:** Bridging OGC APIs and LLMs via MCP & LangGraph
+Proof of Concept: Bridging OGC APIs and LLMs via MCP and LangGraph.
 
 ## What This Proves
 
-An LLM can discover, submit, and **asynchronously manage** OGC Process jobs through a structured two-layer architecture — without any hardcoded workflow logic.
+An LLM can discover, submit, and asynchronously manage OGC Process jobs through a structured two-layer architecture without hardcoded workflow logic.
 
-```
-User prompt
-    │
-    ▼
-┌─────────────────────────────────────┐
-│  Layer 2 · LangGraph Agent          │
-│  Gemini LLM drives the workflow     │
-│  State: IDLE→SUBMITTED→POLLING      │
-│              →SUCCESS / FAILED      │
-└──────────────┬──────────────────────┘
-               │  tool calls
-               ▼
-┌─────────────────────────────────────┐
-│  Layer 1 · FastMCP Server           │
-│  list_processes                     │
-│  execute_process  (→ jobID)         │
-│  get_job_status   (poll loop)       │
-│  get_job_result                     │
-└──────────────┬──────────────────────┘
-               │  HTTP
-               ▼
-   pygeoapi Docker  (localhost:5000)
-```
+High-level flow:
+- Layer 2 (LangGraph agent) decides which tool to call and manages state.
+- Layer 1 (FastMCP tools) wraps pygeoapi OGC endpoints.
+- pygeoapi executes the process and returns job status or results.
 
 ## Project Structure
 
 ```
 ogc-mcp-poc/
 ├── src/ogc_mcp/
-│   ├── server.py   # Layer 1: FastMCP server (4 OGC tools)
+│   ├── server.py   # Layer 1: FastMCP tools for OGC Processes
 │   └── agent.py    # Layer 2: LangGraph state machine
+├── tests/
+│   └── test_async_flow.py  # Mocked async polling test (no real HTTP/LLM calls)
 ├── demo.py         # End-to-end demo script
 ├── requirements.txt
 └── .env.example
 ```
+
+## File Responsibilities
+
+- `src/ogc_mcp/server.py`: Layer 1 tools (list/execute/status/result) wrapped over pygeoapi HTTP endpoints.
+- `src/ogc_mcp/agent.py`: Layer 2 LangGraph state machine, tool routing, and polling loop.
+- `demo.py`: End-to-end demo using the real LLM and pygeoapi.
+- `tests/test_async_flow.py`: Mocked async flow test that forces jobID -> polling -> success -> result.
+- `requirements.txt`: Runtime dependencies.
+- `.env.example`: Environment template for tokens and base URLs.
 
 ## Setup
 
 ### 1. Prerequisites
 
 - Python 3.11+
-- Docker with `pygeoapi` running on `localhost:5000`
-- Google Gemini API key
+- Docker with pygeoapi running on http://localhost:5000
+- Hugging Face token (HF_TOKEN or HUGGINGFACE_HUB_TOKEN)
 
 ### 2. Start pygeoapi
 
@@ -68,7 +60,8 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Edit .env and set your GOOGLE_API_KEY
+# Set HF_TOKEN or HUGGINGFACE_HUB_TOKEN
+# Optionally set HF_MODEL_NAME (default: meta-llama/Llama-3.1-8B-Instruct:sambanova)
 ```
 
 ## Run the Demo
@@ -77,45 +70,55 @@ cp .env.example .env
 python demo.py
 ```
 
-### Expected Output
+### Example Output (synchronous run)
 
 ```
-╔══════════════════════════════════════════════════════════════╗
-║       GSoC PoC: OGC APIs × MCP × LangGraph                  ║
-╚══════════════════════════════════════════════════════════════╝
+--------------------------------------------------------------
+       GSoC PoC: OGC APIs x MCP x LangGraph
+       Layer 1: FastMCP  |  Layer 2: LangGraph Agent
+--------------------------------------------------------------
 
-USER  ▶  I want to run the 'hello-world' OGC process with the
-         input name='GSoC Mentor'. Please execute it, wait for
-         it to finish, and tell me the result.
+USER  ->  I want to run the 'hello-world' OGC process with the input name='GSoC Mentor'.
 
-[Agent · LLM]    Thinking... (phase=IDLE)
-[Agent · Tool]   Calling: execute_process({"process_id": "hello-world", ...})
-[Agent · State]  SUBMITTED — jobID=abc-123-xyz
-[Agent · Poll]   Waiting 2s before next status check (attempt 1/20)...
-[Agent · Tool]   Calling: get_job_status({"job_id": "abc-123-xyz"})
-[Agent · State]  POLLING — status=running
-[Agent · Poll]   Waiting 2s before next status check (attempt 2/20)...
-[Agent · Tool]   Calling: get_job_status({"job_id": "abc-123-xyz"})
-[Agent · State]  SUCCESS — job completed!
-[Agent · Tool]   Calling: get_job_result({"job_id": "abc-123-xyz"})
+[Agent . LLM] Thinking... (phase=IDLE)
+[Agent . LLM] Wants to call: execute_process({"process_id": "hello-world", "inputs": {"name": "GSoC Mentor"}})
+[Agent . Tool] Calling: execute_process({"process_id": "hello-world", "inputs": {"name": "GSoC Mentor"}})
+[Agent . State] SUCCESS - synchronous execution!
 
-AGENT ▶  The hello-world process completed successfully!
-         Result: "Hello GSoC Mentor! This is a greeting from pygeoapi."
+[Agent . LLM] Thinking... (phase=SUCCESS)
+[Agent . LLM] Final answer ready.
 
-✅  Done in 8.3s
+AGENT ->  Hello GSoC Mentor!
+```
+
+### Async Polling Behavior
+
+If the process returns a jobID, the agent will enter the polling loop:
+- call get_job_status every POLL_INTERVAL seconds
+- move to SUCCESS when status is "successful"
+- fetch results via get_job_result
+
+If the process completes synchronously (jobID is null), the polling loop is skipped.
+
+## Tests
+
+Run the async flow test (mocked, no network calls):
+
+```bash
+python tests/test_async_flow.py
 ```
 
 ## Architecture Notes
 
-- **Layer 1 (FastMCP):** Each tool is a thin async HTTP wrapper over pygeoapi. Zero process-specific logic — the same 4 tools work for any OGC process.
-- **Layer 2 (LangGraph):** The state machine adds a `poll_wait` node between POLLING cycles to avoid hammering the server. The LLM decides *when* to poll and *when* to fetch results — no hardcoded logic.
-- **Async-first:** All tool calls use `httpx.AsyncClient` and LangGraph's `ainvoke`.
+- Layer 1 (FastMCP): Thin async HTTP wrappers over pygeoapi. No process-specific logic.
+- Layer 2 (LangGraph): A state machine that manages tool calls, polling, and final response.
+- Tool calling: The model is instructed to emit a strict JSON tool call; the agent extracts JSON even if the model includes extra text.
 
 ## GSoC Proposal Context
 
-This PoC demonstrates the core architectural claim: a universal MCP-to-OGC mapping layer plus a LangGraph orchestration layer can handle the hardest problem in geospatial AI workflows — asynchronous job state management — in a process-agnostic way.
+This PoC demonstrates the core architectural claim: a universal MCP-to-OGC mapping layer plus a LangGraph orchestration layer can handle asynchronous job state management in a process-agnostic way.
 
-The full GSoC project extends this with:
-- Dynamic process discovery and tool generation (no hardcoded process IDs)
+The full project extends this with:
+- Dynamic process discovery and tool generation
 - OGC Features, Maps, and Tiles API support
 - A reusable mapping specification
