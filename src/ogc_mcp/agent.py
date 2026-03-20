@@ -21,11 +21,11 @@ from ogc_mcp.server import execute_process, get_job_result, get_job_status, list
 load_dotenv()
 
 # Hugging Face Inference Providers setup
-HF_MODEL_NAME = os.getenv("HF_MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct:sambanova")
+HF_MODEL_NAME = os.getenv("HF_MODEL_NAME", "deepseek-ai/DeepSeek-R1:sambanova")
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
 
 SYSTEM_PROMPT = """\
-You are a geospatial assistant connected to an OGC Processes API.
+You are an OGC agent connected to an OGC Processes API.
 
 You have access to these tools:
 - list_processes(): Lists all available processes on the OGC server.
@@ -33,19 +33,26 @@ You have access to these tools:
 - get_job_status(job_id): Checks the status of a submitted job.
 - get_job_result(job_id): Retrieves the result of a completed job.
 
-IMPORTANT RULES:
-1. When you need to call a tool, you MUST respond with ONLY a JSON object in this exact format (no other text before or after):
+YOUR OUTPUT FORMAT:
+1. INTERNAL REASONING: You may use <think> tags to plan your move.
+2. ACTION: After </think>, if you need a tool, your output MUST be ONLY a JSON object in this exact format:
 {"tool_call": "<tool_name>", "args": {<arguments>}}
+3. NO EXPLANATIONS: Do not explain the plan outside of <think> tags. If you are calling a tool, the final text must be 100% JSON.
+4. FINAL ANSWER: Only respond with plain text when you are done and no more tool calls are needed.
 
-2. When you have the final answer for the user, respond with plain text only (no JSON).
+STRICT SEQUENTIAL RULE:
+- If a user asks for several things, call the tool for the FIRST unresolved step only.
+- Wait for the tool result before planning the next tool.
+- Do not output multiple tool calls in one message.
+- Do not describe a plan outside <think> tags.
 
-3. Never make up or fabricate results. Always use the tools and wait for real data.
-
-4. Follow this workflow for executing a process:
-   Step 1: Call execute_process with the process_id and inputs
-   Step 2: If you get a jobID back, call get_job_status with that jobID
-   Step 3: If status is "successful", call get_job_result with the jobID
-   Step 4: Present the result to the user in plain text
+PROCESS EXECUTION RULE:
+1. To run a process, call execute_process first.
+2. If a jobID is returned, call get_job_status with that exact jobID.
+3. If status is accepted or running, keep checking status until it becomes successful or failed.
+4. Call get_job_result only after status is successful.
+5. Never guess tool results. If you have not called a tool yet, you do not know the answer.
+6. If list_processes confirms a requested process does not exist, do not call execute_process for it. Tell the user immediately that it is unavailable.
 
 Example tool call:
 {"tool_call": "execute_process", "args": {"process_id": "hello-world", "inputs": {"name": "Test"}}}
@@ -105,10 +112,8 @@ def _hf_call(history: list[Message]) -> str:
     return response
 
 
-def _extract_tool_call(text: str) -> dict | None:
-    """Extract the first JSON tool_call object from a mixed response."""
-    # Try to find a JSON object with tool_call and args
-    # First, try the entire text as JSON
+def _find_tool_call_json(text: str) -> dict | None:
+    """Extract the first JSON tool_call object from arbitrary text."""
     try:
         obj = json.loads(text.strip())
         if isinstance(obj, dict) and "tool_call" in obj and "args" in obj:
@@ -140,12 +145,54 @@ def _extract_tool_call(text: str) -> dict | None:
     return None
 
 
+def _extract_think_content(text: str) -> str:
+    """Join all <think> blocks so we can inspect them without the wrapper tags."""
+    matches = re.findall(r"<think>(.*?)</think>", text, flags=re.DOTALL)
+    return "\n".join(match.strip() for match in matches if match.strip())
+
+
+def _extract_tool_call(text: str) -> dict | None:
+    """Extract a tool call from the non-thought portion of the model output."""
+    clean_text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+    if not clean_text and "<think>" in text:
+        think_text = _extract_think_content(text)
+        if think_text:
+            print("[Agent . Warning] Clean action text was empty; checking <think> block for JSON.")
+            return _find_tool_call_json(think_text)
+        print("[Agent . Warning] Action found only inside <think> block.")
+        return None
+
+    return _find_tool_call_json(clean_text)
+
+
+def _extract_tool_call_from_raw(text: str) -> dict | None:
+    """Fallback extractor for models that hide the action inside reasoning."""
+    think_text = _extract_think_content(text)
+    if think_text:
+        think_tool_call = _find_tool_call_json(think_text)
+        if think_tool_call:
+            return think_tool_call
+    return _find_tool_call_json(text)
+
+
+def _strip_think_blocks(text: str) -> str:
+    """Remove chain-of-thought markup from final answers."""
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    return cleaned or text.strip()
+
+
 async def call_llm(state: AgentState) -> dict:
     """Ask the HF model what to do next."""
     print(f"\n[Agent . LLM] Thinking... (phase={state['phase']})")
     response_text = await asyncio.to_thread(_hf_call, state["messages"])
 
     data = _extract_tool_call(response_text)
+    if not data:
+        data = _extract_tool_call_from_raw(response_text)
+        if data:
+            print("[Agent . LLM] Promoting planned tool call to action.")
+
     if data:
         print(f"[Agent . LLM] Wants to call: {data['tool_call']}({data['args']})")
         return {
@@ -158,10 +205,11 @@ async def call_llm(state: AgentState) -> dict:
             }]
         }
 
+    final_text = _strip_think_blocks(response_text)
     print("[Agent . LLM] Final answer ready.")
     return {
-        "messages": [{"role": "assistant", "content": response_text}],
-        "final_answer": response_text,
+        "messages": [{"role": "assistant", "content": final_text}],
+        "final_answer": final_text,
     }
 
 
