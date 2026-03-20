@@ -27,7 +27,7 @@ BANNER = """
 
 DEMO_PROMPT = (
     "I want to run the 'hello-world' OGC process with the input name='GSoC Mentor'. "
-    "Please execute it, wait for it to finish, and tell me the result."
+    "What geospatial processes are currently available on this server? Briefly explain what the 'hello-world' one does."
 )
 
 
